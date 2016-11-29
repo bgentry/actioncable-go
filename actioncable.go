@@ -377,5 +377,3 @@ type Event struct {
 	Data       json.RawMessage    `json:"data"`
 	Identifier *CommandIdentifier `json:"identifier"`
 }
-
-type EventFunc func(e *Event)
