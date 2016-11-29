@@ -114,6 +114,37 @@ func (c *Client) Unsubscribe(channel string) {
 	}()
 }
 
+// Send an action on a channel. The "action" field of data will be overridden.
+// The return channel will send an error if one is encountered, or will close
+// if the send completes.
+func (c *Client) Send(channel, action string, data map[string]interface{}) <-chan error {
+	if data == nil {
+		data = make(map[string]interface{})
+	}
+	data["action"] = action
+	errc := make(chan error, 1)
+	b, err := json.Marshal(data)
+	if err != nil {
+		errc <- err
+		return errc
+	}
+	doubleEncoded, err := json.Marshal(string(b))
+	if err != nil {
+		errc <- err
+		return errc
+	}
+	cmd := &Command{
+		Command: "message",
+		Identifier: CommandIdentifier{
+			Channel: channel,
+		},
+		Data: doubleEncoded,
+		errc: errc,
+	}
+	c.outboundc <- cmd
+	return errc
+}
+
 func (c *Client) connLoop() {
 	b := backoff.Backoff{
 		Min:    100 * time.Millisecond,
@@ -200,7 +231,13 @@ func (c *Client) connOnce(url string, f func()) error {
 		case cmd := <-c.outboundc:
 			if err := conn.WriteJSON(cmd); err != nil {
 				// TODO: save cmd to a var to be written after reconnect
+				if cmd.errc != nil {
+					cmd.errc <- err
+				}
 				return err
+			}
+			if cmd.errc != nil {
+				close(cmd.errc)
 			}
 		case <-c.inactivityTimeoutTimer.C:
 			return fmt.Errorf("timeout waiting for ping from server")
@@ -298,8 +335,9 @@ type EventOrErr struct {
 
 type Command struct {
 	Command    string            `json:"command"`
-	Data       []byte            `json:"data,omitempty"`
+	Data       json.RawMessage   `json:"data,omitempty"`
 	Identifier CommandIdentifier `json:"identifier"`
+	errc       chan error
 }
 
 type CommandIdentifier struct {
