@@ -305,7 +305,6 @@ func (c *Client) getSub(name string) chan *EventOrErr {
 func (c *Client) receiveMsg(conn *websocket.Conn, recvc chan<- EventOrErr) {
 	event := &Event{}
 	if err := conn.ReadJSON(event); err != nil {
-		fmt.Println("READ ERROR", err)
 		recvc <- EventOrErr{Err: err}
 		return
 	}
