@@ -13,6 +13,10 @@ import (
 	"github.com/jpillora/backoff"
 )
 
+// HeaderFunc is a function that returns HTTP headers.
+type HeaderFunc func() http.Header
+
+// Client is an ActionCable websocket client.
 type Client struct {
 	u                      string
 	dialer                 *websocket.Dialer
@@ -24,7 +28,7 @@ type Client struct {
 
 	// TODO: what actually needs a mutex??
 	mu            sync.Mutex
-	connHdr       http.Header
+	connHdrFunc   HeaderFunc
 	subscriptions map[string]chan *EventOrErr
 	closed        bool
 	donec         chan struct{}
@@ -32,7 +36,10 @@ type Client struct {
 	ref           int
 }
 
-func NewClient(url string, connHdr http.Header) *Client {
+// NewClient creates a new Client that connects to the provided url using the
+// HTTP headers from connHdrFunc, which will be called once for each connection
+// attempt.
+func NewClient(url string, connHdrFunc HeaderFunc) *Client {
 	c := &Client{
 		u: url,
 		dialer: &websocket.Dialer{
@@ -41,7 +48,7 @@ func NewClient(url string, connHdr http.Header) *Client {
 		inactivityTimeout: 6 * time.Second, // 2 * the 3 sec ping interval
 		outboundc:         make(chan *Command, 32),
 		subc:              make(chan string, 32),
-		connHdr:           connHdr,
+		connHdrFunc:       connHdrFunc,
 		subscriptions:     make(map[string]chan *EventOrErr),
 		donec:             make(chan struct{}),
 		waitc:             make(chan struct{}),
@@ -50,6 +57,8 @@ func NewClient(url string, connHdr http.Header) *Client {
 	return c
 }
 
+// Close closes any active connection on the Client and stops it from making
+// additional connections.
 func (c *Client) Close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -60,6 +69,8 @@ func (c *Client) Close() {
 	}
 }
 
+// ErrAlreadySubscribed is returned when the client has already subscribed to
+// a given channel.
 var ErrAlreadySubscribed = errors.New("channel already subscribed")
 
 // Subscribe establishes a subscription to a specific channel. If the channel
@@ -91,6 +102,7 @@ func (c *Client) Subscribe(channel string) (<-chan *EventOrErr, error) {
 	return c.subscriptions[channel], nil
 }
 
+// Unsubscribe stops subscribing to channel.
 func (c *Client) Unsubscribe(channel string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -182,7 +194,8 @@ func (c *Client) drainSubc() {
 
 func (c *Client) connOnce(url string, f func()) error {
 	// per docs, this resp.Body doesn't need to be closed
-	conn, _, err := c.dialer.Dial(c.u, c.connHdr)
+	connHdr := c.connHdrFunc()
+	conn, _, err := c.dialer.Dial(c.u, connHdr)
 	if err != nil {
 		return err
 	}
@@ -194,7 +207,7 @@ func (c *Client) connOnce(url string, f func()) error {
 	recvc := make(chan EventOrErr, 1)
 
 	go c.receiveMsg(conn, recvc)
-	if err := checkWelcome(recvc); err != nil {
+	if err = checkWelcome(recvc); err != nil {
 		return err
 	}
 
@@ -327,11 +340,13 @@ func (c *Client) resubscribe() {
 	}()
 }
 
+// EventOrErr is an Event or error returned on a subscription channel.
 type EventOrErr struct {
 	Event *Event
 	Err   error
 }
 
+// Command is a command issued on a channel.
 type Command struct {
 	Command    string            `json:"command"`
 	Data       json.RawMessage   `json:"data,omitempty"`
@@ -339,7 +354,9 @@ type Command struct {
 	errc       chan error
 }
 
+// CommandIdentifier identifies which Channel a Command occurs on.
 type CommandIdentifier struct {
+	// Channel is the name of the channel.
 	Channel string
 }
 
@@ -347,6 +364,7 @@ type innerIdentifier struct {
 	Channel string `json:"channel"`
 }
 
+// MarshalJSON encodes the CommandIdentifier to JSON.
 func (c *CommandIdentifier) MarshalJSON() ([]byte, error) {
 	b, err := json.Marshal(innerIdentifier{
 		Channel: c.Channel,
@@ -357,6 +375,7 @@ func (c *CommandIdentifier) MarshalJSON() ([]byte, error) {
 	return json.Marshal(string(b))
 }
 
+// UnmarshalJSON decodes the CommandIdentifier from JSON.
 func (c *CommandIdentifier) UnmarshalJSON(data []byte) error {
 	str := ""
 	if err := json.Unmarshal(data, &str); err != nil {
@@ -370,6 +389,7 @@ func (c *CommandIdentifier) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// Event is a subscription event received on a channel.
 type Event struct {
 	Type string `json:"type"`
 
