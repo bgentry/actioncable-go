@@ -13,8 +13,8 @@ import (
 	"github.com/jpillora/backoff"
 )
 
-// HeaderFunc is a function that returns HTTP headers.
-type HeaderFunc func() http.Header
+// HeaderFunc is a function that returns HTTP headers or an error.
+type HeaderFunc func() (*http.Header, error)
 
 // Client is an ActionCable websocket client.
 type Client struct {
@@ -38,7 +38,8 @@ type Client struct {
 
 // NewClient creates a new Client that connects to the provided url using the
 // HTTP headers from connHdrFunc, which will be called once for each connection
-// attempt.
+// attempt. If connHdrFunc returns an error when called, that will cause the
+// connection attempt to fail.
 func NewClient(url string, connHdrFunc HeaderFunc) *Client {
 	c := &Client{
 		u: url,
@@ -194,8 +195,11 @@ func (c *Client) drainSubc() {
 
 func (c *Client) connOnce(url string, f func()) error {
 	// per docs, this resp.Body doesn't need to be closed
-	connHdr := c.connHdrFunc()
-	conn, _, err := c.dialer.Dial(c.u, connHdr)
+	connHdr, err := c.connHdrFunc()
+	if err != nil {
+		return err
+	}
+	conn, _, err := c.dialer.Dial(c.u, *connHdr)
 	if err != nil {
 		return err
 	}
