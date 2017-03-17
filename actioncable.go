@@ -28,6 +28,7 @@ type Client struct {
 
 	// TODO: what actually needs a mutex??
 	mu            sync.Mutex
+	subscData     map[string]json.RawMessage
 	connHdrFunc   HeaderFunc
 	subscriptions map[string]chan *EventOrErr
 	closed        bool
@@ -49,6 +50,7 @@ func NewClient(url string, connHdrFunc HeaderFunc) *Client {
 		inactivityTimeout: 6 * time.Second, // 2 * the 3 sec ping interval
 		outboundc:         make(chan *Command, 32),
 		subc:              make(chan string, 32),
+		subscData:         make(map[string]json.RawMessage),
 		connHdrFunc:       connHdrFunc,
 		subscriptions:     make(map[string]chan *EventOrErr),
 		donec:             make(chan struct{}),
@@ -86,6 +88,7 @@ var ErrAlreadySubscribed = errors.New("channel already subscribed")
 // disconnects, so a confirm_subscription event might be a good time to
 // resynchronize state that might be stale.
 func (c *Client) Subscribe(channel string) (<-chan *EventOrErr, error) {
+	var err error
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -94,6 +97,44 @@ func (c *Client) Subscribe(channel string) (<-chan *EventOrErr, error) {
 	}
 
 	c.subscriptions[channel] = make(chan *EventOrErr, 32)
+	c.subscData[channel], err = json.Marshal(&innerIdentifier{Channel: channel})
+	if err != nil {
+		panic(err)
+	}
+
+	// Add subscription command to outbound queue.
+	go func() {
+		c.subc <- channel
+	}()
+
+	return c.subscriptions[channel], nil
+}
+
+var ErrNoChannelName = errors.New("Subscription data must contain a channel name")
+
+// SubscribeWith subscribes to a channel giving parameters
+// the params must contain a field "channel" containing the channe to subscribe to
+func (c *Client) SubscribeWith(params json.RawMessage) (<-chan *EventOrErr, error) {
+	var id innerIdentifier
+	err := json.Unmarshal(params, &id)
+	if err != nil {
+		return nil, err
+	}
+	if id.Channel == "" {
+		return nil, ErrNoChannelName
+	}
+
+	channel := id.Channel
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, alreadySubscribed := c.subscriptions[channel]; alreadySubscribed {
+		return nil, ErrAlreadySubscribed
+	}
+
+	c.subscriptions[channel] = make(chan *EventOrErr, 32)
+	c.subscData[channel] = params
 
 	// Add subscription command to outbound queue.
 	go func() {
@@ -113,6 +154,7 @@ func (c *Client) Unsubscribe(channel string) {
 		return
 	}
 	delete(c.subscriptions, channel)
+	delete(c.subscData, channel)
 	close(ch)
 
 	cmd := &Command{
@@ -236,10 +278,14 @@ func (c *Client) connOnce(url string, f func()) error {
 			}
 			c.handleEvent(eventOrErr.Event)
 		case chanName := <-c.subc:
+			c.mu.Lock()
+			params := c.subscData[chanName]
+			c.mu.Unlock()
 			cmd := &Command{
 				Command: "subscribe",
 				Identifier: CommandIdentifier{
 					Channel: chanName,
+					RawData: params,
 				},
 			}
 			if err := conn.WriteJSON(cmd); err != nil {
@@ -362,6 +408,7 @@ type Command struct {
 type CommandIdentifier struct {
 	// Channel is the name of the channel.
 	Channel string
+	RawData json.RawMessage
 }
 
 type innerIdentifier struct {
@@ -370,13 +417,16 @@ type innerIdentifier struct {
 
 // MarshalJSON encodes the CommandIdentifier to JSON.
 func (c *CommandIdentifier) MarshalJSON() ([]byte, error) {
-	b, err := json.Marshal(innerIdentifier{
-		Channel: c.Channel,
-	})
-	if err != nil {
-		return nil, err
+	var err error
+	if c.RawData == nil {
+		c.RawData, err = json.Marshal(innerIdentifier{
+			Channel: c.Channel,
+		})
+		if err != nil {
+			return nil, err
+		}
 	}
-	return json.Marshal(string(b))
+	return json.Marshal(string(c.RawData))
 }
 
 // UnmarshalJSON decodes the CommandIdentifier from JSON.
@@ -385,8 +435,9 @@ func (c *CommandIdentifier) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &str); err != nil {
 		return err
 	}
+	c.RawData = json.RawMessage(str)
 	inner := innerIdentifier{}
-	if err := json.Unmarshal([]byte(str), &inner); err != nil {
+	if err := json.Unmarshal(c.RawData, &inner); err != nil {
 		return err
 	}
 	c.Channel = inner.Channel
